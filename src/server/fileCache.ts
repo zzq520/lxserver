@@ -214,6 +214,22 @@ const ensureDir = (username?: string, isOnlyDownload?: boolean) => {
     return dir
 }
 
+// Safe rename: try rename, fall back to copy+unlink if rename fails (cross-device, permissions, etc.)
+const safeRenameSync = (src: string, dst: string) => {
+    try {
+        fs.renameSync(src, dst)
+        return true
+    } catch (err) {
+        try {
+            fs.copyFileSync(src, dst)
+            fs.unlinkSync(src)
+            return true
+        } catch (err2) {
+            throw err // keep original error context
+        }
+    }
+}
+
 /**
  * 规范化歌曲 ID：确保带上 source 前缀，与索引中的 Key 保持一致
  */
@@ -1511,6 +1527,7 @@ export const switchFolder = async (filenames: string[], username: string | undef
     for (const filename of filenames) {
         let sourceFolder: 'cache' | 'music' | null = null
         let item: CacheItem | null = null
+        let inMusic: CacheItem | undefined = undefined
 
         // Find which folder it belongs to
         const inCache = Array.from(cacheIndex.values()).find(i => i.filename === filename)
@@ -1518,7 +1535,7 @@ export const switchFolder = async (filenames: string[], username: string | undef
             sourceFolder = 'cache'
             item = inCache
         } else {
-            const inMusic = Array.from(musicIndex.values()).find(i => i.filename === filename)
+            inMusic = Array.from(musicIndex.values()).find(i => i.filename === filename)
             if (inMusic) {
                 sourceFolder = 'music'
                 item = inMusic
@@ -1526,6 +1543,7 @@ export const switchFolder = async (filenames: string[], username: string | undef
         }
 
         if (!sourceFolder || !item) {
+            console.log(`[FileCache][DEBUG] switchFolder: not found in indexes`, { filename, inCache: !!inCache, inMusic: !!inMusic })
             failCount++
             continue
         }
@@ -1546,62 +1564,82 @@ export const switchFolder = async (filenames: string[], username: string | undef
         const targetPath = path.join(targetDir, filename)
 
         try {
-            if (fs.existsSync(sourcePath)) {
-                // Ensure target directory exists (though getCacheDir should have ensured it)
-                if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true })
+            console.log(`[FileCache][DEBUG] switchFolder start`, { filename, sourceFolder, targetFolder, sourcePath, targetPath })
+            const srcExists = fs.existsSync(sourcePath)
+            const tgtExists = fs.existsSync(targetPath)
+            console.log(`[FileCache][DEBUG] existence`, { filename, srcExists, tgtExists })
+
+            if (srcExists) {
+                // Ensure target directory exists (including any nested subfolders)
+                const targetPathDir = path.dirname(targetPath)
+                if (!fs.existsSync(targetPathDir)) fs.mkdirSync(targetPathDir, { recursive: true })
 
                 // Check collision in target folder
                 if (fs.existsSync(targetPath)) {
-                    // If target already exists, skip this file
                     console.log(`[FileCache] Move conflict: ${filename} already exists in ${targetFolder}, skipping.`)
                     failCount++
                     continue
                 }
 
-
                 // Move audio file
-                fs.renameSync(sourcePath, targetPath)
+                try {
+                    safeRenameSync(sourcePath, targetPath)
+                    console.log(`[FileCache][DEBUG] moved audio`, { filename, sourcePath, targetPath })
+                } catch (moveErr) {
+                    const errMsg = moveErr instanceof Error ? moveErr.stack : String(moveErr)
+                    console.error(`[FileCache][ERROR] move audio failed for ${filename}:`, errMsg)
+                    failCount++
+                    continue
+                }
 
                 // Move lyric file if exists
                 if (item.lyricFilename) {
                     const sourceLrcPath = path.join(sourceDir, item.lyricFilename)
                     const targetLrcPath = path.join(targetDir, item.lyricFilename)
+                    const targetLrcDir = path.dirname(targetLrcPath)
                     if (fs.existsSync(sourceLrcPath)) {
+                        if (!fs.existsSync(targetLrcDir)) fs.mkdirSync(targetLrcDir, { recursive: true })
                         if (fs.existsSync(targetLrcPath)) fs.unlinkSync(targetLrcPath)
-                        fs.renameSync(sourceLrcPath, targetLrcPath)
+                        try {
+                            safeRenameSync(sourceLrcPath, targetLrcPath)
+                            console.log(`[FileCache][DEBUG] moved lyric`, { filename, sourceLrcPath, targetLrcPath })
+                        } catch (lrErr) {
+                            const errMsg = lrErr instanceof Error ? lrErr.stack : String(lrErr)
+                            console.error(`[FileCache][ERROR] move lyric failed for ${filename}:`, errMsg)
+                        }
+                    } else {
+                        console.log(`[FileCache][DEBUG] lyric not found`, { filename, sourceLrcPath })
                     }
                 }
 
                 // Update Index
-                indexManager.remove(normalizedUsername, item.id, sourceFolder, item.quality)
+                const removed = indexManager.remove(normalizedUsername, item.id, sourceFolder, item.quality)
+                console.log(`[FileCache][DEBUG] index remove result`, { filename, removed })
                 item.folder = targetFolder
                 indexManager.update(normalizedUsername, item, targetFolder)
-
                 successCount++
             } else {
+                console.log(`[FileCache][DEBUG] source missing`, { filename, sourcePath })
                 failCount++
             }
         } catch (e) {
-            console.error(`[FileCache] Failed to move ${filename} from ${sourceFolder} to ${targetFolder}:`, e)
+            const errMsg = e instanceof Error ? e.stack : String(e)
+            console.error(`[FileCache] Failed to move ${filename}:`, errMsg)
             failCount++
         }
+        }
+
+        return { successCount, failCount }
     }
 
-    return { successCount, failCount }
-}
+    export const switchBaseLocation = async (filenames: string[], username: string | undefined) => {
+        const normalizedUsername = (username && username !== '_open' && username !== 'default') ? username : '_open'
+        let successCount = 0
+        let failCount = 0
+        const sourceLoc = currentCacheLocation
+        const targetLoc = sourceLoc === CACHE_ROOTS.DATA ? CACHE_ROOTS.ROOT : CACHE_ROOTS.DATA
 
-/**
- * Switch files between 'ROOT' and 'DATA' base locations
- */
-export const switchBaseLocation = async (filenames: string[], username: string | undefined) => {
-    const normalizedUsername = (username && username !== '_open' && username !== 'default') ? username : '_open'
-    const sourceLoc = currentCacheLocation
-    const targetLoc = sourceLoc === CACHE_ROOTS.ROOT ? CACHE_ROOTS.DATA : CACHE_ROOTS.ROOT
-
-    let successCount = 0
-    let failCount = 0
-
-    const folders: Array<'cache' | 'music'> = ['cache', 'music']
+        const folders: Array<'cache' | 'music'> = ['cache', 'music']
 
     // Helper to get dir for a specific location
     const getLocalDir = (folder: string, loc: string) => {
@@ -1639,7 +1677,8 @@ export const switchBaseLocation = async (filenames: string[], username: string |
 
         try {
             if (fs.existsSync(sourcePath)) {
-                if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true })
+                const targetPathDir = path.dirname(targetPath)
+                if (!fs.existsSync(targetPathDir)) fs.mkdirSync(targetPathDir, { recursive: true })
 
                 // Check collision in target location
                 if (fs.existsSync(targetPath)) {
@@ -1649,15 +1688,17 @@ export const switchBaseLocation = async (filenames: string[], username: string |
                 }
 
                 // Move audio file
-                fs.renameSync(sourcePath, targetPath)
+                safeRenameSync(sourcePath, targetPath)
 
                 // Move lyrics
                 if (item.lyricFilename) {
                     const sourceLrcPath = path.join(sourceDir, item.lyricFilename)
                     const targetLrcPath = path.join(targetDir, item.lyricFilename)
+                    const targetLrcDir = path.dirname(targetLrcPath)
                     if (fs.existsSync(sourceLrcPath)) {
+                        if (!fs.existsSync(targetLrcDir)) fs.mkdirSync(targetLrcDir, { recursive: true })
                         if (fs.existsSync(targetLrcPath)) fs.unlinkSync(targetLrcPath)
-                        fs.renameSync(sourceLrcPath, targetLrcPath)
+                        safeRenameSync(sourceLrcPath, targetLrcPath)
                     }
                 }
 
@@ -1756,15 +1797,15 @@ export const categorizeFiles = async (filenames: string[], targetSubPath: string
 
         try {
             // Physically move file
-            if (fs.existsSync(oldPath)) {
-                fs.renameSync(oldPath, newPath)
+                if (fs.existsSync(oldPath)) {
+                safeRenameSync(oldPath, newPath)
 
                 // Move lyrics if exist
                 const ext = path.extname(filename)
                 const oldLrcPath = oldPath.substring(0, oldPath.length - ext.length) + '.lrc'
                 const newLrcPath = newPath.substring(0, newPath.length - ext.length) + '.lrc'
                 if (fs.existsSync(oldLrcPath)) {
-                    fs.renameSync(oldLrcPath, newLrcPath)
+                    safeRenameSync(oldLrcPath, newLrcPath)
                 }
 
                 // Update index
@@ -1781,8 +1822,8 @@ export const categorizeFiles = async (filenames: string[], targetSubPath: string
             }
 
             successCount++
-        } catch (e) {
-            console.error(`[FileCache] Categorize failed for ${filename}:`, e)
+        } catch (e: any) {
+            console.error('[FileCache] Categorize failed for ' + filename + ':', e)
             failCount++
         }
     }
