@@ -163,6 +163,9 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
         return false;
     }
 
+    const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
+    const actionLabel = isOnlyDownload ? '下载到服务器' : '缓存到服务器';
+
     let selected = skipPromptTarget;
     if (!selected) {
         // [优化] 检测是否已缓存
@@ -170,8 +173,8 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
         const checkResult = await window.checkServerCache?.(song, prefQuality);
         const cacheSuffix = (checkResult?.exists && !checkResult?.isCollision) ? ' (已缓存)' : '';
 
-        const options = ['浏览器下载', `缓存到服务器${cacheSuffix}`];
-        const modeText = window.settings?.['enableOnlyDownloadMode'] ? '仅下载模式' : '缓存模式';
+        const options = ['浏览器下载', `${actionLabel}${cacheSuffix}`];
+        const modeText = isOnlyDownload ? '仅下载模式' : '缓存模式';
         selected = await showOptions('下载与缓存', `[${modeText}] 选择对 [${song.name}] 的操作：`, options);
     }
     if (!selected) return false;
@@ -204,7 +207,16 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
             showError('下载管理器未就绪');
             return false;
         }
-    } else if (selected === '缓存到服务器') {
+    } else if (selected && (selected.startsWith('缓存到服务器') || selected.startsWith('下载到服务器'))) {
+        // [优化] 检测是否已缓存
+        const prefQuality = window.settings?.preferredQuality || '320k';
+        const checkResult = await window.checkServerCache?.(song, prefQuality);
+        const isCached = checkResult?.exists && !checkResult?.isCollision;
+
+        if (!isOnlyDownload && isCached) {
+            showInfo('该歌曲已在服务器缓存');
+            return false;
+        }
         let targetQuality = forceQuality;
         if (!targetQuality) {
             // 获取该歌曲实际支持的音质列表
@@ -226,7 +238,6 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
         const enablePublicRestriction = window.lx_config?.['user.enablePublicRestriction'];
         const isAdmin = !!localStorage.getItem('lx_admin_password');
         const isServerCacheAllowed = window.settings?.enableServerCache === true;
-        const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
 
         if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin && !isOnlyDownload) {
             showError('权限限制：缓存到服务器需要验证管理员。');

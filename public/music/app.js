@@ -89,7 +89,10 @@ const DEFAULT_SETTINGS = {
     swapLyricTransRoma: false, // 交换翻译与罗马音位置
     autoCompactPlaybar: true, // 自动精简控制栏 (默认开启)
     enableAutoSwitchSource: true, // 自动尝试换源 (默认开启)
+    enableAutoSwitchApiSource: true, // 自动解析换源 (默认开启)
     enableAutoSkipOnError: true, // 失败自动下一曲 (默认开启)
+    enableAutoDegradeQuality: true, // 自动降低音质 (默认开启)
+    playbackErrorPriority: 'platform,quality,next', // 播放失败处理优先级
     enablePreloader: true, // 预读机制 (默认开启)
     enableSmtcLyric: true, // SMTC 歌词显示 (默认开启)
     // Visualizer Settings (Refactored)
@@ -128,6 +131,8 @@ let currentRawTlrc = '';
 let currentRawRlrc = '';
 let currentRawKlrc = ''; // 逐词歌词 (klyric/lxlyric)
 let lastLyricSongId = null; // 追踪上次加载歌词的歌曲ID
+
+let currentRecoveryState = null; // 播放失败自动恢复状态管理
 
 // 从 localStorage 加载设置
 try {
@@ -2679,39 +2684,54 @@ prefetchManager.init(); // 立即初始化缓冲器
  * 统一的歌曲解析入口，支持播放和预读调用
  * 包含：本地/服务器缓存检查、在线解析、自动降级逻辑
  */
-async function resolveSongUrl(song, quality, isSilent = false, isRetry = false) {
+async function resolveSongUrl(song, quality, isSilent = false, isRetry = false, disableFallback = false) {
     try {
         const result = await fetchSongUrl(song, quality, isRetry, isSilent);
         if (result.errorMsg) throw new Error(result.errorMsg);
         return result;
     } catch (error) {
-        // 区分“平台不支持”和“解析失败”
+        if (disableFallback) {
+            throw error;
+        }
+
+        // 默认降级/换源的 fallback 逻辑 (用于预读或下载等不直接受播放器重试接管的场景)
         const isPlatformNotSupported = error.message && (
             error.message.includes('未找到支持') ||
             error.message.includes('not supported')
         );
 
-        // 如果不是平台问题，且还有下级音质，递归尝试降级
-        const nextQuality = isPlatformNotSupported ? null : window.QualityManager.getNextLowerQuality(quality, song);
-
-        if (nextQuality) {
-            if (!isSilent) {
-                const fromName = window.QualityManager.getQualityDisplayName(quality);
-                const toName = window.QualityManager.getQualityDisplayName(nextQuality);
-                showInfo(`从 ${fromName} 降级到 ${toName} 播放...`);
+        // 解析降级/换源优先级
+        const order = (settings.playbackErrorPriority || 'platform,quality,next').split(',');
+        const steps = [];
+        for (const key of order) {
+            if (key === 'quality' && settings.enableAutoDegradeQuality !== false) {
+                steps.push('degrade');
+            } else if (key === 'platform' && settings.enableAutoSwitchSource !== false) {
+                steps.push('switch_platform');
             }
-            return await resolveSongUrl(song, nextQuality, isSilent, true);
         }
 
-        // 核心增强：如果质量降级也失败了，且开启了自动尝试换源
-        if (settings.enableAutoSwitchSource && !isSilent) {
-            console.log(`[AutoSource] 原始源解析失败，准备尝试全网匹配: ${song.name}`);
-            const matchedSong = await findOtherSourceMatch(song);
-            if (matchedSong) {
-                showInfo(`找到备选源，尝试从 ${getSourceName(matchedSong.source)} 播放...`);
-                // 递归调用，但不再允许再次换源（避免死循环），且 fallback 到备选歌曲的最佳音质
-                const bestNextQuality = window.QualityManager.getBestQuality(matchedSong, settings.preferredQuality || '320k');
-                return await fetchSongUrl(matchedSong, bestNextQuality, true, isSilent);
+        for (const step of steps) {
+            if (step === 'degrade') {
+                const nextQuality = isPlatformNotSupported ? null : window.QualityManager.getNextLowerQuality(quality, song);
+                if (nextQuality) {
+                    if (!isSilent) {
+                        const fromName = window.QualityManager.getQualityDisplayName(quality);
+                        const toName = window.QualityManager.getQualityDisplayName(nextQuality);
+                        showInfo(`从 ${fromName} 降级到 ${toName} 播放...`);
+                    }
+                    return await resolveSongUrl(song, nextQuality, isSilent, true, false);
+                }
+            } else if (step === 'switch_platform') {
+                if (!isSilent) {
+                    console.log(`[AutoSource] 原始源解析失败，准备尝试全网匹配: ${song.name}`);
+                    const matchedSong = await findOtherSourceMatch(song);
+                    if (matchedSong) {
+                        showInfo(`找到备选源，尝试从 ${getSourceName(matchedSong.source)} 播放...`);
+                        const bestNextQuality = window.QualityManager.getBestQuality(matchedSong, settings.preferredQuality || '320k');
+                        return await fetchSongUrl(matchedSong, bestNextQuality, true, isSilent);
+                    }
+                }
             }
         }
 
@@ -2877,7 +2897,7 @@ async function fetchSongUrl(song, quality, isRetry = false, isSilent = false) {
     const cleanedSong = cleanSongData(song);
     const cacheKey = `lx_url_${cleanedSong.id}_${quality}`;
 
-    const allowServerCache = settings.preferServerCache !== false;
+    const allowServerCache = settings.preferServerCache !== false && isRetry !== 'local_retry';
     if (allowServerCache) {
         let cacheResult = await checkServerCache(cleanedSong, quality, !!isRetry);
         if (cacheResult.exists && !cacheResult.isCollision) {
@@ -2928,7 +2948,11 @@ async function fetchSongUrl(song, quality, isRetry = false, isSilent = false) {
         const res = await fetch(`${API_BASE}/url`, {
             method: 'POST',
             headers,
-            body: JSON.stringify({ songInfo: song, quality })
+            body: JSON.stringify({
+                songInfo: song,
+                quality,
+                enableAutoSwitchApiSource: settings.enableAutoSwitchApiSource !== false
+            })
         });
 
         if (!res.ok) {
@@ -3390,6 +3414,73 @@ function playFromView(index) {
 }
 window.playFromView = playFromView;
 
+async function runRecoveryFlow(error) {
+    if (!currentRecoveryState) return;
+
+    const { steps, currentStepIndex } = currentRecoveryState;
+    if (currentStepIndex >= steps.length) {
+        // All recovery steps exhausted
+        setPlayerStatus('播放失败');
+        showError(`播放失败: ${error.message || '未知错误'}`);
+        updatePlayButton(false);
+        return;
+    }
+
+    const currentStep = steps[currentStepIndex];
+    console.log(`[Recovery] Executing recovery step: ${currentStep} (${currentStepIndex + 1}/${steps.length})`);
+
+    if (currentStep === 'degrade') {
+        const nextQuality = window.QualityManager.getNextLowerQuality(currentRecoveryState.currentQuality, currentRecoveryState.currentSong);
+        if (nextQuality && !currentRecoveryState.triedQualities.includes(nextQuality)) {
+            currentRecoveryState.currentQuality = nextQuality;
+            currentRecoveryState.triedQualities.push(nextQuality);
+            
+            const fromName = window.QualityManager.getQualityDisplayName(currentRecoveryState.triedQualities[currentRecoveryState.triedQualities.length - 2]);
+            const toName = window.QualityManager.getQualityDisplayName(nextQuality);
+            showInfo(`从 ${fromName} 降级到 ${toName} 播放...`);
+            
+            // Re-invoke playSong with isRetry = true so we don't reset recovery state
+            playSong(currentRecoveryState.currentSong, currentRecoveryState.currentIndex, nextQuality, false, true);
+        } else {
+            // Quality degradation failed/exhausted, move to next recovery step
+            currentRecoveryState.currentStepIndex++;
+            await runRecoveryFlow(error);
+        }
+    } else if (currentStep === 'switch_platform') {
+        if (currentRecoveryState.currentSong === currentRecoveryState.originalSong) {
+            showInfo('正在自动尝试换源匹配...');
+            const matchedSong = await findOtherSourceMatch(currentRecoveryState.originalSong);
+            if (matchedSong) {
+                currentRecoveryState.currentSong = matchedSong;
+                currentRecoveryState.triedPlatforms.push(matchedSong.source);
+                const bestNextQuality = window.QualityManager.getBestQuality(matchedSong, settings.preferredQuality || '320k');
+                currentRecoveryState.currentQuality = bestNextQuality;
+                currentRecoveryState.triedQualities = [bestNextQuality];
+                
+                showInfo(`找到备选源，尝试从 ${getSourceName(matchedSong.source)} 播放...`);
+                // Re-invoke playSong with isRetry = true
+                playSong(matchedSong, currentRecoveryState.currentIndex, bestNextQuality, false, true);
+            } else {
+                // No match found, move to next recovery step
+                currentRecoveryState.currentStepIndex++;
+                await runRecoveryFlow(error);
+            }
+        } else {
+            // Already switched once, move to next recovery step
+            currentRecoveryState.currentStepIndex++;
+            await runRecoveryFlow(error);
+        }
+    } else if (currentStep === 'skip_next') {
+        const isPlatformNotSupported = error && error.message && (
+            error.message.includes('未找到支持') ||
+            error.message.includes('not supported')
+        );
+        setPlayerStatus('播放失败，即将跳过', null, true);
+        if (window._autoSkipTimer) clearTimeout(window._autoSkipTimer);
+        window._autoSkipTimer = setTimeout(() => playNext(), isPlatformNotSupported ? 2000 : 3000);
+    }
+}
+
 async function playSong(song, index, forceQuality = null, noPlay = false, isRetry = false, shouldAddToDefault = null) {
     // 1. Debounce / Lock: If already loading this song, ignore click
     // [Fix] Allow retry to bypass this check
@@ -3409,6 +3500,39 @@ async function playSong(song, index, forceQuality = null, noPlay = false, isRetr
     const thisRequestId = ++loadingRequestCounter;
     currentLoadingSongId = thisRequestSongId;
     currentLoadingRequestId = thisRequestId;
+
+    if (!isRetry) {
+        const order = (settings.playbackErrorPriority || 'platform,quality,next').split(',');
+        const steps = [];
+        for (const key of order) {
+            if (key === 'quality' && settings.enableAutoDegradeQuality !== false) {
+                steps.push('degrade');
+            } else if (key === 'platform' && settings.enableAutoSwitchSource !== false) {
+                steps.push('switch_platform');
+            } else if (key === 'next' && settings.enableAutoSkipOnError !== false) {
+                steps.push('skip_next');
+            }
+        }
+
+        const startQuality = forceQuality || window.QualityManager.getBestQuality(song, settings.preferredQuality || '320k');
+
+        currentRecoveryState = {
+            originalSong: song,
+            currentIndex: index,
+            currentSong: song,
+            originalQuality: startQuality,
+            currentQuality: startQuality,
+            triedQualities: [startQuality],
+            triedPlatforms: [song.source],
+            steps: steps,
+            currentStepIndex: 0,
+            thisRequestId: thisRequestId
+        };
+    } else {
+        if (currentRecoveryState) {
+            currentRecoveryState.thisRequestId = thisRequestId;
+        }
+    }
 
     currentIndex = index;
     // [Random Prefetch Fix] 一旦开始正式播放一首歌曲，清除之前的预选索引，以便下一轮重新生成
@@ -3500,7 +3624,7 @@ async function playSong(song, index, forceQuality = null, noPlay = false, isRetr
                 targetQuality = window.QualityManager.getBestQuality(song, settings.preferredQuality || '320k');
             }
             setPlayerStatus('正在获取播放链接', null, true);
-            urlResult = await resolveSongUrl(song, targetQuality, false, isRetry);
+            urlResult = await resolveSongUrl(song, targetQuality, false, isRetry, !noPlay);
         }
 
         // 2. Stale Check
@@ -3640,20 +3764,13 @@ async function playSong(song, index, forceQuality = null, noPlay = false, isRetr
         if (currentLoadingRequestId !== thisRequestId) return;
         console.error('[Player] Error:', error);
 
-        setPlayerStatus('播放失败');
-        showError(`播放失败: ${error.message || '未知错误'}`);
-
-        // 区分“平台不支持”错误
-        const isPlatformNotSupported = error.message && (
-            error.message.includes('未找到支持') ||
-            error.message.includes('not supported')
-        );
-
-        if (settings.enableAutoSkipOnError || isPlatformNotSupported) {
-            if (window._autoSkipTimer) clearTimeout(window._autoSkipTimer);
-            window._autoSkipTimer = setTimeout(() => playNext(), isPlatformNotSupported ? 2000 : 3000);
+        if (currentRecoveryState && currentRecoveryState.thisRequestId === thisRequestId && !noPlay) {
+            await runRecoveryFlow(error);
+        } else {
+            setPlayerStatus('播放失败');
+            showError(`播放失败: ${error.message || '未知错误'}`);
+            updatePlayButton(false);
         }
-        updatePlayButton(false);
     } finally {
         if (currentLoadingRequestId === thisRequestId) {
             currentLoadingRequestId = 0;
@@ -4984,7 +5101,10 @@ const SETTINGS_UI_MAP = {
     autoResume: { id: 'setting-auto-resume', type: 'checkbox' },
     autoCompactPlaybar: { id: 'setting-auto-compact-playbar', type: 'checkbox' },
     enableAutoSwitchSource: { id: 'setting-auto-switch-source', type: 'checkbox' },
+    enableAutoSwitchApiSource: { id: 'setting-auto-switch-api-source', type: 'checkbox' },
     enableAutoSkipOnError: { id: 'setting-auto-skip-on-error', type: 'checkbox' },
+    enableAutoDegradeQuality: { id: 'setting-auto-degrade-quality', type: 'checkbox' },
+    playbackErrorPriority: { id: 'setting-playback-error-priority', type: 'value' },
     enablePreloader: { id: 'setting-enable-preloader', type: 'checkbox' },
     deduplicatePlaylistByQuality: { id: 'setting-deduplicate-playlist', type: 'checkbox' },
     enableSmtcLyric: {
@@ -9260,8 +9380,9 @@ async function renderCustomSources() {
             container.appendChild(div);
         });
 
-        // Add Sortable (Optimized for Mobile)
-        if (containerId === 'custom-sources-list' && typeof Sortable !== 'undefined') {
+        // Add Sortable for both the modal list and the settings panel list
+        const isSortableContainer = (containerId === 'custom-sources-list' || containerId === 'settings-custom-sources-list') && typeof Sortable !== 'undefined';
+        if (isSortableContainer) {
             try {
                 const oldSortable = Sortable.get(container);
                 if (oldSortable) oldSortable.destroy();
@@ -9277,8 +9398,24 @@ async function renderCustomSources() {
                 delay: 200,
                 delayOnTouchOnly: true,
                 onEnd: async function (evt) {
+                    // 防止两个容器同时触发 onEnd 导致重复请求
+                    if (window._reorderLock) return;
+                    window._reorderLock = true;
+                    setTimeout(() => { window._reorderLock = false; }, 500);
+
+                    // DOM 已由 SortableJS 更新，直接读取新顺序
                     const items = Array.from(container.querySelectorAll('.source-item'));
                     const finalOrderIds = items.map(el => el.dataset.id);
+
+                    // 同步另一个容器的 DOM 顺序（保持两者一致）
+                    const otherId = containerId === 'custom-sources-list' ? 'settings-custom-sources-list' : 'custom-sources-list';
+                    const otherContainer = document.getElementById(otherId);
+                    if (otherContainer) {
+                        finalOrderIds.forEach(id => {
+                            const el = otherContainer.querySelector(`.source-item[data-id="${id}"]`);
+                            if (el) otherContainer.appendChild(el);
+                        });
+                    }
 
                     try {
                         const username = currentListData?.username || 'default';
@@ -9296,13 +9433,15 @@ async function renderCustomSources() {
                             showError('权限限制：保存排序需要管理员身份。');
                             const authorized = await handleAdminAuth('保存排序需要管理员身份');
                             if (authorized) renderCustomSources();
+                            else renderCustomSources();
                             return;
                         }
                         if (!response.ok) throw new Error('Reorder failed');
-                        renderCustomSources();
+                        // 成功：DOM 已是正确顺序，无需重新拉取
+                        showInfo('排序已保存');
                     } catch (error) {
                         console.error('Reorder error:', error);
-                        showError('保存排序失败');
+                        showError('保存排序失败，已还原');
                         renderCustomSources();
                     }
                 }
@@ -10446,8 +10585,10 @@ async function handleDownloadClick(event) {
     const checkResult = await window.checkServerCache?.(song, prefQuality);
     const cacheSuffix = (checkResult?.exists && !checkResult?.isCollision) ? ' (已缓存)' : '';
 
-    const options = ['浏览器下载', `缓存到服务器${cacheSuffix}`];
-    const modeText = window.settings?.['enableOnlyDownloadMode'] ? '仅下载模式' : '缓存模式';
+    const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
+    const actionLabel = isOnlyDownload ? '下载到服务器' : '缓存到服务器';
+    const options = ['浏览器下载', `${actionLabel}${cacheSuffix}`];
+    const modeText = isOnlyDownload ? '仅下载模式' : '缓存模式';
     const selected = await showOptions('下载与缓存', `[${modeText}] 选择对 [${song.name}] 的操作：`, options);
 
     if (selected === '浏览器下载') {
@@ -10456,13 +10597,18 @@ async function handleDownloadClick(event) {
         } else {
             showError('下载功能未就绪');
         }
-    } else if (selected === '缓存到服务器') {
+    } else if (selected && (selected.startsWith('缓存到服务器') || selected.startsWith('下载到服务器'))) {
+        const isCached = checkResult?.exists && !checkResult?.isCollision;
+        if (!isOnlyDownload && isCached) {
+            showInfo('该歌曲已在服务器缓存');
+            return;
+        }
+
         // [新增] 权限校验：受限公开用户需要验证管理员
         const isPublic = !window.currentListData?.username || window.currentListData?.username === 'default';
         const enablePublicRestriction = window.lx_config?.['user.enablePublicRestriction'];
         const isAdmin = !!localStorage.getItem('lx_admin_password');
         const isServerCacheAllowed = window.settings?.enableServerCache === true;
-        const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
 
         if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin && !isOnlyDownload) {
             showError('权限限制：缓存到服务器需要验证管理员。');
@@ -10475,7 +10621,7 @@ async function handleDownloadClick(event) {
         }
 
         if (typeof downloadSong === 'function') {
-            downloadSong(song, null, false, '缓存到服务器');
+            downloadSong(song, null, false, actionLabel);
         } else {
             showError('服务器缓存逻辑未就绪');
         }
@@ -12072,7 +12218,10 @@ window.CustomSelectManager = {
             dropdown.classList.remove('open-up');
         }
     },
-    handleScrollOrResize() {
+    handleScrollOrResize(e) {
+        if (e && e.target && e.target.closest && e.target.closest('.cs-dropdown')) {
+            return;
+        }
         window.CustomSelectManager.closeAll();
     },
     syncUI(select, wrapper) {

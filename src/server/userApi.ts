@@ -386,7 +386,8 @@ export async function loadUserApi(apiInfo: UserApiInfo): Promise<any> {
             console.error(`[UserApi] [Stack] ${fullApiInfo.name}:`, error.stack)
         }
         // 返回详细错误信息而不是直接抛出
-        return { success: false, apiInstance: null, error: error.message, requireUnsafe: error.message === 'REQUIRE_UNSAFE_VM' }
+        const isRequireUnsafe = !apiInfo.allowUnsafeVM && (error.message === 'REQUIRE_UNSAFE_VM' || error.message.includes('初始化超时') || error.message.includes('timeout'))
+        return { success: false, apiInstance: null, error: error.message, requireUnsafe: isRequireUnsafe }
     }
 }
 
@@ -396,7 +397,8 @@ export async function callUserApiGetMusicUrl(
     songInfo: any,
     quality: string,
     clientUsername?: string,
-    onProgress?: (attempt: any) => Promise<void> | void
+    onProgress?: (attempt: any) => Promise<void> | void,
+    enableAutoSwitchApiSource?: boolean
 ): Promise<{ url: string, type: string, sourceName?: string, attempts?: any[] }> {
     // 标准化 songInfo 格式：将 meta 中的字段提升到顶层
     const normalizedSongInfo = { ...songInfo }
@@ -492,7 +494,7 @@ export async function callUserApiGetMusicUrl(
     const candidates: any[] = []
     const userApiIds = new Set<string>()
 
-    // 读取当前用户的自定公开源状态（启用/禁用覆盖）以及个人拥有记录
+    // 读取当前用户的公开源状态覆盖（启用/禁用）以及私有源 ID 集合
     let userStates: Record<string, any> = {}
     if (clientUsername && clientUsername !== 'default') {
         const dataPath = process.env.DATA_PATH || path.join(process.cwd(), 'data')
@@ -503,35 +505,21 @@ export async function callUserApiGetMusicUrl(
         if (fs.existsSync(statesPath)) {
             try { userStates = JSON.parse(fs.readFileSync(statesPath, 'utf-8')) } catch (e) { }
         }
-
-        // 把用户个人的所有源 (包含已禁用的) ID 收集起来，为了彻底屏蔽同名公开源
+        // 预收集私有源 ID（用于屏蔽同名公开源）
         if (fs.existsSync(metaPath)) {
             try {
                 const userSources = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
-                for (const s of userSources) {
-                    userApiIds.add(s.id)
-                }
+                for (const s of userSources) userApiIds.add(s.id)
             } catch (e) { }
         }
     }
 
-    // 第一遍：收集当前用户启用的源
-    for (const [apiId, api] of loadedApis) {
-        if (!api.info.enabled) continue
-        if (!api.info.sources || !api.info.sources[source]) continue
-
-        if (clientUsername && api.info.owner === clientUsername) {
-            candidates.push(api)
-            userApiIds.add(api.info.id) // 兜底补录
-        }
-    }
-
-    // 第二遍：收集公开源，但排除用户自己已有的同名源
+    // 按 loadedApis 收集所有可用候选源（权限过滤，不强制任何顺序）
     for (const [apiId, api] of loadedApis) {
         if (!api.info.sources || !api.info.sources[source]) continue
 
         if (api.info.owner === 'open') {
-            // 获取最终有效的启用状态
+            // 计算公开源对当前用户的有效启用状态
             let isEnabled = api.info.enabled
             if (clientUsername && clientUsername !== 'default' && userStates[api.info.id]) {
                 if (typeof userStates[api.info.id].enabled === 'boolean') {
@@ -539,11 +527,52 @@ export async function callUserApiGetMusicUrl(
                 }
             }
             if (!isEnabled) continue
+            if (userApiIds.has(api.info.id)) continue  // 被同名私有版本覆盖，跳过
+            candidates.push(api)
+        } else if (clientUsername && api.info.owner === clientUsername) {
+            if (!api.info.enabled) continue
+            candidates.push(api)
+            userApiIds.add(api.info.id) // 兜底：确保后续不重复添加公开同名源
+        }
+    }
 
-            if (!userApiIds.has(api.info.id)) {
-                candidates.push(api)
+    // === 实时按 order.json 对候选列表排序 ===
+    // 不依赖 loadedApis 的 Map 插入顺序（部分 reload 后顺序会乱），
+    // 每次解析都直接读 order.json，无需重启服务器即可生效
+    if (candidates.length > 1) {
+        const dataPath = process.env.DATA_PATH || path.join(process.cwd(), 'data')
+        let orderData: string[] = []
+
+        // 优先读用户自己的排序（admin/order.json），再回退到公开源排序（_open/order.json）
+        const orderCandidates = clientUsername && clientUsername !== 'default'
+            ? [
+                path.join(dataPath, 'users', 'source', clientUsername, 'order.json'),
+                path.join(dataPath, 'users', 'source', '_open', 'order.json')
+              ]
+            : [path.join(dataPath, 'users', 'source', '_open', 'order.json')]
+
+        for (const orderPath of orderCandidates) {
+            if (fs.existsSync(orderPath)) {
+                try {
+                    orderData = JSON.parse(fs.readFileSync(orderPath, 'utf-8'))
+                    if (orderData.length > 0) break
+                } catch (e) { }
             }
         }
+
+        if (orderData.length > 0) {
+            const idToIndex = new Map(orderData.map((id, i) => [id, i]))
+            candidates.sort((a: any, b: any) => {
+                const ia = idToIndex.has(a.info.id) ? idToIndex.get(a.info.id)! : 999999
+                const ib = idToIndex.has(b.info.id) ? idToIndex.get(b.info.id)! : 999999
+                return ia - ib
+            })
+        }
+    }
+    // =========================================
+
+    if (enableAutoSwitchApiSource === false && candidates.length > 1) {
+        candidates = [candidates[0]]
     }
 
     supportedCount = candidates.length
@@ -636,8 +665,25 @@ async function loadSourcesFromDir(dirPath: string, owner: string, stats: { loade
     }
 
     try {
-        const sources = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
+        let sources = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
         let needsSave = false
+
+        // === 按 order.json 排序，确保 loadedApis 插入顺序 = 用户配置的优先级顺序 ===
+        const orderPath = path.join(dirPath, 'order.json')
+        if (fs.existsSync(orderPath)) {
+            try {
+                const order: string[] = JSON.parse(fs.readFileSync(orderPath, 'utf-8'))
+                if (order.length > 0) {
+                    const idToIndex = new Map(order.map((id, i) => [id, i]))
+                    sources = [...sources].sort((a: any, b: any) => {
+                        const ia = idToIndex.has(a.id) ? idToIndex.get(a.id)! : 999999
+                        const ib = idToIndex.has(b.id) ? idToIndex.get(b.id)! : 999999
+                        return ia - ib
+                    })
+                }
+            } catch (e) { }
+        }
+        // =========================================================================
 
         for (const source of sources) {
             if (!source.enabled && owner !== 'open') {
@@ -698,7 +744,11 @@ async function loadSourcesFromDir(dirPath: string, owner: string, stats: { loade
         }
 
         if (needsSave) {
-            fs.writeFileSync(metaPath, JSON.stringify(sources, null, 2));
+            // Write back using the original (file-order) sources array to avoid overwriting sources.json ordering
+            const originalSources = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
+            const updatedMap = new Map(sources.map((s: any) => [s.id, s]))
+            const merged = originalSources.map((s: any) => updatedMap.get(s.id) || s)
+            fs.writeFileSync(metaPath, JSON.stringify(merged, null, 2));
             console.log(`[UserApi] [${owner}] 已更新 sources.json 元数据`);
         }
     } catch (error: any) {

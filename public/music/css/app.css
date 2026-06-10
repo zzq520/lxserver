@@ -865,6 +865,12 @@ aside {
     box-sizing: border-box;
 }
 
+.cs-trigger-text {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+}
+
 .cs-trigger-icon {
     font-size: 8px;
     transition: transform 0.2s ease;

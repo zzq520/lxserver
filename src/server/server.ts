@@ -3862,7 +3862,7 @@ const handleStartServer = async (port = 9527, ip = '127.0.0.1') => await new Pro
           }
 
           try {
-            let { songInfo, quality } = JSON.parse(body)
+            let { songInfo, quality, enableAutoSwitchApiSource } = JSON.parse(body)
             songInfo = normalizeSongInfo(songInfo)
             // console.log('[MusicUrl] Song Info:', JSON.stringify(songInfo, null, 2))
             if (!songInfo || !songInfo.source) {
@@ -3879,7 +3879,8 @@ const handleStartServer = async (port = 9527, ip = '127.0.0.1') => await new Pro
 
                 const userApiResult = await callUserApiGetMusicUrl(
                   source, songInfo, quality || '128k', verifiedUsername,
-                  (attempt) => { void pushProgress(attempt) }
+                  (attempt) => { void pushProgress(attempt) },
+                  enableAutoSwitchApiSource !== false
                 )
                 result = userApiResult
                 attempts = userApiResult.attempts || []
