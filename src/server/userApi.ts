@@ -491,7 +491,7 @@ export async function callUserApiGetMusicUrl(
 
     // 查找支持该 source 的 API
     // 收集所有支持该 source 的 API，并根据权限过滤
-    const candidates: any[] = []
+    let candidates: any[] = []
     const userApiIds = new Set<string>()
 
     // 读取当前用户的公开源状态覆盖（启用/禁用）以及私有源 ID 集合

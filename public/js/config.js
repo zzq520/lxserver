@@ -2,6 +2,6 @@
 // 其余配置由服务端在运行时动态注入 (环境变量 > config.js > defaultConfig.ts)
 // 服务端拦截 /js/config.js 请求, 读取此处版本号并合并服务端配置后返回
 window.CONFIG = {
-    buildHash: '10b7e52',
+    buildHash: 'c95106b',
     version: 'v1.9.4',
 };
